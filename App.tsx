@@ -1,8 +1,8 @@
 ﻿import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as NavigationBar from 'expo-navigation-bar';
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
-  Alert,
+  Alert, // ✅ [추가] 포그라운드/백그라운드 감지 (앱 이탈 시 ON 적용 X + 세션 동기화)
   Animated,
   Dimensions,
   FlatList,
@@ -11,6 +11,7 @@ import {
   NativeEventEmitter,
   NativeModules,
   Platform,
+  AppState as RNAppState,
   StatusBar,
   StyleSheet,
   Text,
@@ -33,6 +34,12 @@ const INTERSTITIAL_REQUEST_OPTIONS = {
   tagForUnderAgeOfConsent: false,
 };
 
+// ✅ [추가] 30분 세션 + START 광고 게이트
+const SESSION_START_AT_KEY = 'SWITCHING_SESSION_START_AT';
+const SESSION_DURATION_MS = 30 * 60 * 1000;
+const START_AD_OPEN_TIMEOUT_MS = 1500; // 1~2초 요구사항 반영
+const START_AD_MAX_TRIES = 3; 
+
 interface AppInfo {
   label: string;
   packageName: string;
@@ -52,18 +59,46 @@ export default function App() {
   const [isEnabled, setIsEnabled] = useState<boolean>(false);
   const fadeAnim = useRef(new Animated.Value(0)).current;
 
+  const hintLoopRef = useRef<any>(null); // ✅ [추가] 힌트 애니메이션 stop 처리용(루프 누수 방지)
+
+  // ✅ [추가] 로고 크로스페이드 진행률(0=청록(app-logo2) → 1=빨강(app-logo))
+  const progressAnim = useRef(new Animated.Value(1)).current;
+  const sessionStartAtRef = useRef<number | null>(null); // ✅ [추가] 30분 세션 시작 시각
+  const sessionOffTimerRef = useRef<any>(null);          // ✅ [추가] 30분 종료 타이머
+  const progressTimerRef = useRef<any>(null);            // ✅ [추가] 진행률 업데이트 타이머
+
+  // ✅ [추가] START 광고 플로우 상태(연타/재시도/앱이탈 처리)
+  const startFlowRef = useRef({
+    isActive: false,
+    tries: 0,
+    adOpened: false,
+    appLeft: false,
+  });
+
+  const startOpenTimeoutRef = useRef<any>(null);         // ✅ [추가] 1~2초 내 광고 미노출 감지
+  const startTapLockRef = useRef<boolean>(false);        // ✅ [추가] 연타 방지
+  const [startWaitModalVisible, setStartWaitModalVisible] = useState(false); // ✅ [추가]
+
   useEffect(() => {
     if (!isEnabled) {
-      Animated.loop(
+      hintLoopRef.current?.stop?.(); // ✅ [추가]
+      hintLoopRef.current = Animated.loop(
         Animated.sequence([
           Animated.timing(fadeAnim, { toValue: 1, duration: 800, useNativeDriver: true }),
           Animated.timing(fadeAnim, { toValue: 0, duration: 800, useNativeDriver: true }),
         ])
-      ).start();
+      );
+      hintLoopRef.current.start(); // ✅ [수정]
     } else {
+      hintLoopRef.current?.stop?.(); // ✅ [추가]
       fadeAnim.setValue(0);
     }
+
+    return () => {
+      hintLoopRef.current?.stop?.(); // ✅ [추가]
+    };
   }, [isEnabled]);
+
   const interstitialRef = useRef<any>(null);
   const adLoadedRef = useRef<boolean>(false);
   const pendingSaveRef = useRef<boolean>(false);
@@ -82,6 +117,161 @@ export default function App() {
   useEffect(() => {
     stateRef.current = { targetPackage, isEnabled, isPremium };
   }, [targetPackage, isEnabled, isPremium]);
+
+  // ✅ [추가] 세션/타이머 유틸
+  const clearSessionTimers = () => {
+    if (sessionOffTimerRef.current) {
+      clearTimeout(sessionOffTimerRef.current);
+      sessionOffTimerRef.current = null;
+    }
+    if (progressTimerRef.current) {
+      clearInterval(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+  };
+
+  const getProgress = (startAt: number) => {
+    const elapsed = Date.now() - startAt;
+    const raw = elapsed / SESSION_DURATION_MS;
+    return Math.max(0, Math.min(1, raw));
+  };
+
+  const expireSession = async () => {
+    await AsyncStorage.removeItem(SESSION_START_AT_KEY);
+    sessionStartAtRef.current = null;
+    clearSessionTimers();
+    progressAnim.setValue(1);
+
+    // ✅ [추가] 30분 종료 시 자동 OFF (네이티브 설정도 OFF로)
+    setIsEnabled(false);
+    if (AppSwitchModule?.saveSettings) {
+      AppSwitchModule.saveSettings(stateRef.current.targetPackage, false);
+    }
+  };
+
+  const syncSession = async () => {
+    const saved = await AsyncStorage.getItem(SESSION_START_AT_KEY);
+    const startAt = saved ? Number(saved) : null;
+
+    if (!startAt || Number.isNaN(startAt)) {
+      sessionStartAtRef.current = null;
+      clearSessionTimers();
+      progressAnim.setValue(1);
+      return null;
+    }
+
+    const elapsed = Date.now() - startAt;
+    if (elapsed >= SESSION_DURATION_MS) {
+      await expireSession();
+      return null;
+    }
+
+    sessionStartAtRef.current = startAt;
+
+    // ✅ [추가] 진행률 반영(아주 천천히 변화하지만 복귀 시 즉시 정확 보정)
+    const p = getProgress(startAt);
+    Animated.timing(progressAnim, { toValue: p, duration: 250, useNativeDriver: false }).start();
+
+    // ✅ [추가] 정확히 30분에 자동 OFF
+    if (sessionOffTimerRef.current) clearTimeout(sessionOffTimerRef.current);
+    const remain = SESSION_DURATION_MS - (Date.now() - startAt);
+    sessionOffTimerRef.current = setTimeout(() => {
+      void expireSession();
+    }, remain);
+
+    // ✅ [추가] ON일 때 표시를 위해 진행률 주기 업데이트(백그라운드에서는 의미 없음)
+    if (!progressTimerRef.current) {
+      progressTimerRef.current = setInterval(() => {
+        const s = sessionStartAtRef.current;
+        if (!s) return;
+        progressAnim.setValue(getProgress(s));
+      }, 1000);
+    }
+
+    return startAt;
+  };
+
+  const startNewSessionAndEnable = async () => {
+    const now = Date.now();
+    await AsyncStorage.setItem(SESSION_START_AT_KEY, String(now));
+    sessionStartAtRef.current = now;
+
+    // ✅ [추가] ON 시작은 청록부터
+    progressAnim.setValue(0);
+
+    // ✅ [추가] ON으로 저장(프리미엄/광고 완료/광고 우회 포함 공통)
+    setIsEnabled(true);
+    if (AppSwitchModule?.saveSettings) {
+      AppSwitchModule.saveSettings(stateRef.current.targetPackage, true);
+    }
+
+    // ✅ [추가] 타이머 재설정
+    clearSessionTimers();
+    sessionOffTimerRef.current = setTimeout(() => {
+      void expireSession();
+    }, SESSION_DURATION_MS);
+
+    progressTimerRef.current = setInterval(() => {
+      const s = sessionStartAtRef.current;
+      if (!s) return;
+      progressAnim.setValue(getProgress(s));
+    }, 1000);
+  };
+
+  // ✅ [추가] START 광고 요청(1~2초 내 OPENED 안되면 모달, 2회 재시도, 3번째 실패면 그냥 구동)
+  const requestStartWithAdGate = async () => {
+    if (startTapLockRef.current) return; // ✅ [추가] 연타 방지
+    startTapLockRef.current = true;
+    setTimeout(() => { startTapLockRef.current = false; }, 700);
+
+    startFlowRef.current.isActive = true;
+    startFlowRef.current.tries += 1;
+    startFlowRef.current.adOpened = false;
+    startFlowRef.current.appLeft = false;
+
+    const ad = interstitialRef.current;
+
+    if (adLoadedRef.current && ad?.show) {
+      ad.show();
+    } else if (ad?.load) {
+      ad.load(); // LOADED 리스너에서 show 처리
+    }
+
+    if (startOpenTimeoutRef.current) clearTimeout(startOpenTimeoutRef.current);
+    startOpenTimeoutRef.current = setTimeout(() => {
+      if (!startFlowRef.current.isActive) return;
+      if (startFlowRef.current.adOpened) return;
+
+      if (startFlowRef.current.tries >= START_AD_MAX_TRIES) {
+        // ✅ [추가] 3번째도 광고가 안 나오면 그냥 구동
+        startFlowRef.current.isActive = false;
+        setStartWaitModalVisible(false);
+        void startNewSessionAndEnable();
+      } else {
+        setStartWaitModalVisible(true);
+      }
+    }, START_AD_OPEN_TIMEOUT_MS);
+  };
+
+  // ✅ [추가] 앱 이탈 시(백그라운드) 광고 봐도 ON 적용 X + 포그라운드 복귀 시 세션 동기화
+  useEffect(() => {
+    void syncSession();
+
+    const sub = RNAppState.addEventListener('change', (next) => { // ✅ [수정]
+      if (next !== 'active' && startFlowRef.current.isActive) {
+        startFlowRef.current.appLeft = true; // ✅ [추가] 앱 이탈 체크
+      }
+      if (next === 'active') {
+        void syncSession(); // ✅ [추가] 복귀 시 진행률/만료 즉시 보정
+      }
+    });
+
+    return () => {
+      sub.remove();
+      if (startOpenTimeoutRef.current) clearTimeout(startOpenTimeoutRef.current);
+      clearSessionTimers();
+    };
+  }, []);
 
   useEffect(() => { 
     if (!targetPackage || !appList.length) return;
@@ -112,6 +302,7 @@ export default function App() {
 
      let mounted = true; 
     let unsubscribeLoaded: any = null; 
+    let unsubscribeOpened: any = null; // ✅ [추가]
     let unsubscribeClosed: any = null; 
     let unsubscribeError: any = null; 
 
@@ -133,14 +324,45 @@ export default function App() {
           adLoadedRef.current = true; 
           setAdLoaded(true);
 
+          // ✅ [추가] START 플로우가 광고를 기다리면 로드 즉시 show
+          if (startFlowRef.current.isActive && interstitialRef.current?.show) {
+            interstitialRef.current.show();
+            return;
+          }
+
           if (pendingSaveRef.current && interstitialRef.current?.show) {
             interstitialRef.current.show();
           }
         }); 
 
+        unsubscribeOpened = ad.addAdEventListener(mod.AdEventType.OPENED, () => { // ✅ [추가]
+          // ✅ [추가] 1~2초 내 OPENED 감지(모달 닫기)
+          if (startFlowRef.current.isActive) {
+            startFlowRef.current.adOpened = true;
+            setStartWaitModalVisible(false);
+          }
+          if (startOpenTimeoutRef.current) clearTimeout(startOpenTimeoutRef.current);
+        });
+
         unsubscribeClosed = ad.addAdEventListener(mod.AdEventType.CLOSED, () => {
           adLoadedRef.current = false; 
           setAdLoaded(false);
+
+          // ✅ [추가] START 광고 시청 완료 처리(앱 이탈이면 ON 적용 X)
+          if (startFlowRef.current.isActive) {
+            const aborted = startFlowRef.current.appLeft;
+
+            startFlowRef.current.isActive = false;
+            startFlowRef.current.adOpened = false;
+            startFlowRef.current.appLeft = false;
+            startFlowRef.current.tries = 0;
+            setStartWaitModalVisible(false);
+            if (startOpenTimeoutRef.current) clearTimeout(startOpenTimeoutRef.current);
+
+            if (!aborted) {
+              void startNewSessionAndEnable();
+            }
+          }
 
           if (pendingSaveRef.current) {
             pendingSaveRef.current = false;
@@ -154,7 +376,20 @@ export default function App() {
           adLoadedRef.current = false; 
           setAdLoaded(false);
           pendingSaveRef.current = false;
-          console.warn("Interstitial ERROR:", err); 
+          console.warn("Interstitial ERROR:", err);
+
+          // ✅ [추가] START 플로우: 3번째 실패면 광고 없이 구동, 아니면 모달
+          if (startFlowRef.current.isActive) {
+            if (startOpenTimeoutRef.current) clearTimeout(startOpenTimeoutRef.current);
+
+            if (startFlowRef.current.tries >= START_AD_MAX_TRIES) {
+              startFlowRef.current.isActive = false;
+              setStartWaitModalVisible(false);
+              void startNewSessionAndEnable();
+            } else {
+              setStartWaitModalVisible(true);
+            }
+          }
         });
 
         ad.load(); 
@@ -171,6 +406,7 @@ export default function App() {
       mounted = false; 
       clearTimeout(t); 
     try { unsubscribeLoaded && unsubscribeLoaded(); } catch {} 
+      try { unsubscribeOpened && unsubscribeOpened(); } catch {} // ✅ [추가]
       try { unsubscribeClosed && unsubscribeClosed(); } catch {} 
       try { unsubscribeError && unsubscribeError(); } catch {} 
       adLoadedRef.current = false; 
@@ -274,6 +510,7 @@ export default function App() {
   };
 
   const toggleEnabledByLogo = async () => {
+    // ✅ [추가] ON 시도 시 접근성 권한 체크는 유지
     if (!isEnabled) {
       if (AppSwitchModule?.isAccessibilityServiceEnabled) {
         const isGranted = await AppSwitchModule.isAccessibilityServiceEnabled();
@@ -291,13 +528,34 @@ export default function App() {
       }
     }
 
-    setIsEnabled((prev) => {
-      const nextState = !prev;
+    // ✅ [추가] 이미 ON이면 → OFF(세션은 유지: 30분 안이면 다시 ON 시 광고 없이 진행)
+    if (isEnabled) {
+      setIsEnabled(false);
       if (AppSwitchModule?.saveSettings) {
-        AppSwitchModule.saveSettings(targetPackage, nextState);
+        AppSwitchModule.saveSettings(targetPackage, false);
       }
-      return nextState;
-    });
+      return;
+    }
+
+    // ✅ [추가] OFF → ON 시도
+    // 1) 세션이 아직 살아있으면(30분 안) 광고 없이 즉시 ON
+    const startAt = await syncSession();
+    if (startAt) {
+      setIsEnabled(true);
+      if (AppSwitchModule?.saveSettings) {
+        AppSwitchModule.saveSettings(targetPackage, true);
+      }
+      return;
+    }
+
+    // 2) 세션이 없거나(시작 전) 끝났으면(만료) → 프리미엄은 즉시 ON+세션 시작
+    if (isPremium) {
+      await startNewSessionAndEnable();
+      return;
+    }
+
+    // 3) 무료면 START 광고 게이트 (1~2초 내 미노출이면 모달, 2회 재시도, 3번째도 실패면 그냥 구동)
+    await requestStartWithAdGate();
   };
 
   const renderItem = ({ item }: { item: AppInfo }) => (
@@ -353,15 +611,40 @@ export default function App() {
               activeOpacity={0.9} 
               style={[styles.logoContainer, isEnabled && styles.logoGlow]}
           >
-            <Image
-              source={
-                isEnabled
-                  ? require('./assets/app-logo2.png')
-                  : require('./assets/app-logo.png')
-              }
-              style={[styles.logoImage, { opacity: isEnabled ? 1 : 0.4 }]} 
-              resizeMode="contain"
-            />
+            {!isEnabled ? (
+              <Image
+                source={require('./assets/app-logo.png')}
+                style={[styles.logoImage, { opacity: 0.4 }]}
+                resizeMode="contain"
+              />
+            ) : (
+              <View style={styles.logoStack}>
+                <Animated.Image
+                  source={require('./assets/app-logo2.png')}
+                  style={[
+                    styles.logoImage,
+                    styles.logoAbs,
+                    {
+                      opacity: progressAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [1, 0],
+                      }),
+                    },
+                  ]}
+                  resizeMode="contain"
+                />
+                <Animated.Image
+                  source={require('./assets/app-logo.png')}
+                  style={[
+                    styles.logoImage,
+                    {
+                      opacity: progressAnim,
+                    },
+                  ]}
+                  resizeMode="contain"
+                />
+              </View>
+            )}
           </TouchableOpacity>
           
           <Text style={[styles.statusLabel, { color: isEnabled ? '#1dd4f5' : '#555' }]}>
@@ -422,6 +705,32 @@ export default function App() {
             />
           ) : null}
         </View>
+
+        <Modal
+          animationType="fade"
+          transparent={true}
+          visible={startWaitModalVisible}
+          onRequestClose={() => setStartWaitModalVisible(false)}
+        >
+          <View style={styles.startWaitOverlay}>
+            <View style={styles.startWaitBox}>
+              <Text style={styles.startWaitText}>
+                시스템을 구동중입니다.{"\n"}잠시 후 광고가 나옵니다.
+              </Text>
+
+              <TouchableOpacity
+                style={styles.startWaitBtn}
+                activeOpacity={0.8}
+                onPress={() => {
+                  setStartWaitModalVisible(false);
+                  void requestStartWithAdGate();
+                }}
+              >
+                <Text style={styles.startWaitBtnText}>다시 시도</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
 
         <Modal
           animationType="fade"
@@ -493,12 +802,58 @@ const styles = StyleSheet.create({
     borderRadius: 100,
   },
   logoImage: { width: 160, height: 160 },
+  logoStack: { position: 'relative' }, // ✅ [추가]
+  logoAbs: { position: 'absolute', top: 0, left: 0 }, // ✅ [추가]
   logoGlow: {
     shadowColor: '#dae1e7',
     shadowOffset: { width: 0, height: 0 },
     shadowOpacity: 0.9,
     shadowRadius: 40,
     elevation: 25,
+  },
+
+  // ✅ [추가] START 대기 모달
+  startWaitOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+  },
+  startWaitBox: {
+    width: '100%',
+    maxWidth: 320,
+    backgroundColor: '#111',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#222',
+    paddingVertical: 18,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  startWaitText: {
+    color: '#d7d7d7',
+    fontSize: 12,
+    fontWeight: '600',
+    letterSpacing: 0.3,
+    textAlign: 'center',
+    lineHeight: 18,
+    marginBottom: 14,
+  },
+  startWaitBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 18,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#49a0c2',
+    backgroundColor: 'rgba(255,255,255,0.05)',
+  },
+  startWaitBtnText: {
+    color: '#c8d0d4',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
   },
   statusLabel: {
     fontSize: 13,
@@ -542,11 +897,11 @@ const styles = StyleSheet.create({
   arrowText: { color: '#444', fontSize: 20 },
 
   footerArea: {
-    position: 'absolute',
-    bottom: Platform.OS === 'android' ? 200 :190, 
+    // ✅ [수정] absolute 제거 → TARGET APP 섹션과 하단 광고(adContainer) 사이에 자연 배치
     width: '100%',
     alignItems: 'center',
-    zIndex: 20
+    justifyContent: 'center', // ✅ [추가]
+    paddingVertical: 16,      // ✅ [추가] 광고와 너무 붙지 않게
   },
   fabButton: {
     flexDirection: 'row',
