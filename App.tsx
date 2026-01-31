@@ -52,17 +52,26 @@ export default function App() {
   const [isEnabled, setIsEnabled] = useState<boolean>(false);
   const fadeAnim = useRef(new Animated.Value(0)).current;
 
+  // [수정] 애니메이션 로직 강화: 꺼지면 0으로 강제 고정
   useEffect(() => {
+    let animation = null;
     if (!isEnabled) {
-      Animated.loop(
+      // 1. 꺼져있을 때 (Offline): 깜빡임 시작
+      animation = Animated.loop(
         Animated.sequence([
           Animated.timing(fadeAnim, { toValue: 1, duration: 800, useNativeDriver: true }),
           Animated.timing(fadeAnim, { toValue: 0, duration: 800, useNativeDriver: true }),
         ])
-      ).start();
+      );
+      animation.start();
     } else {
+      // 2. 켜졌을 때 (Online): 애니메이션 멈추고 투명도 0으로 강제 고정
+      fadeAnim.stopAnimation();
       fadeAnim.setValue(0);
     }
+    return () => {
+        if(animation) animation.stop();
+    };
   }, [isEnabled]);
 
   const interstitialRef = useRef<any>(null);
@@ -343,12 +352,14 @@ export default function App() {
 
         <View style={styles.mainContent}>
 
-          {!isEnabled && (
-            <Animated.View style={[styles.hintContainer, { opacity: fadeAnim }]}>
-              <Text style={styles.handEmoji}>👇 </Text>
-              <Text style={styles.hintText}>TAP to{"\n"}START</Text>
-            </Animated.View>
-          )}
+          {/* [수정] style에서 조건문을 빼고, 애니메이션 값(fadeAnim)만 바라보게 변경 */}
+          <Animated.View 
+            style={[styles.hintContainer, { opacity: fadeAnim }]}
+            pointerEvents={isEnabled ? 'none' : 'auto'}
+          >
+            <Text style={styles.handEmoji}>👇 </Text>
+            <Text style={styles.hintText}>TAP to{"\n"}START</Text>
+          </Animated.View>
           
           <TouchableOpacity 
               onPress={toggleEnabledByLogo} 
@@ -400,14 +411,15 @@ export default function App() {
                   </View>
               </TouchableOpacity>
           </View>
-        
-        <View style={styles.footerArea}>
-          <TouchableOpacity style={styles.fabButton} onPress={handleSaveWithLogic}>
-              <Text style={styles.fabIcon}>💾</Text>
-              <Text style={styles.fabText}>Save</Text>
-          </TouchableOpacity>
+          
+          {/* ✅ [이동됨] 카드 컨테이너 바로 아래로 이동 */}
+          <View style={styles.footerArea}>
+            <TouchableOpacity style={styles.fabButton} onPress={handleSaveWithLogic}>
+                <Text style={styles.fabIcon}>💾</Text>
+                <Text style={styles.fabText}>Save</Text>
+            </TouchableOpacity>
+          </View>
         </View>
-      </View>
 
 
         <View style={styles.adContainer}>
@@ -488,7 +500,7 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingTop: 50,
+    paddingBottom: 80 
   },
   logoContainer: {
     marginBottom: 25,
@@ -543,21 +555,20 @@ const styles = StyleSheet.create({
   cardArrow: { paddingLeft: 10 },
   arrowText: { color: '#444', fontSize: 20 },
 
-  footerArea: {
-    width: '100%',
+  footerArea: {    
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 40, // 카드와의 간격 조절
+    marginTop: 50,
     zIndex: 20
   },
   fabButton: {
     flexDirection: 'row',
     backgroundColor: 'rgba(255, 255, 255, 0.05)',
     paddingVertical: 10,
-    paddingHorizontal: 40,       
+    paddingHorizontal: 40,        
     borderRadius: 4,              
     alignItems: 'center',
-    borderWidth: 0.9,           
+    borderWidth: 0.9,            
     borderColor: '#49a0c2',          
   },
   fabIcon: { display: 'none' },   
@@ -617,8 +628,8 @@ const styles = StyleSheet.create({
     position: 'absolute',
     flexDirection: 'row', 
     alignItems: 'center', 
-    top: 80,             
-    right: '12%',         
+    top: 80,            
+    right: '12%',        
     zIndex: 30,
   },
   hintText: {
